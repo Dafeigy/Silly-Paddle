@@ -106,7 +106,7 @@ API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 python app.py
 ```
 
-服务默认监听 `http://0.0.0.0:8000`，`reload=True` 支持代码热更新。
+服务默认监听 `http://0.0.0.0:4000`，`reload=True` 支持代码热更新。
 
 成功启动后可以看到：
 
@@ -118,7 +118,7 @@ INFO:ocr-service: Pipeline 就绪
 INFO:     Application startup complete.
 ```
 
-访问 http://localhost:8000/docs 可进入自动生成的 Swagger UI 交互文档。
+访问 http://localhost:4000/docs 可进入自动生成的 Swagger UI 交互文档。
 
 ### 4. 调用示例
 
@@ -129,7 +129,7 @@ INFO:     Application startup complete.
 base64 -w0 scan.png > scan.b64
 
 # 调用 API
-curl -X POST http://localhost:8000/ocr/base64 \
+curl -X POST http://localhost:4000/ocr/base64 \
   -H "Content-Type: application/json" \
   -d '{"payload": "'$(cat scan.b64)'", "fileType": 1}'
 ```
@@ -137,7 +137,7 @@ curl -X POST http://localhost:8000/ocr/base64 \
 #### 4.2 带 data URI 前缀（自动推断格式）
 
 ```bash
-curl -X POST http://localhost:8000/ocr/base64 \
+curl -X POST http://localhost:4000/ocr/base64 \
   -H "Content-Type: application/json" \
   -d '{"payload": "data:image/png;base64,iVBORw0KGgo...", "fileType": 1}'
 ```
@@ -147,7 +147,7 @@ curl -X POST http://localhost:8000/ocr/base64 \
 ```bash
 base64 -w0 report.pdf > report.b64
 
-curl -X POST http://localhost:8000/ocr/base64 \
+curl -X POST http://localhost:4000/ocr/base64 \
   -H "Content-Type: application/json" \
   -d '{"payload": "'$(cat report.b64)'", "fileType": 0}'
 ```
@@ -156,10 +156,10 @@ curl -X POST http://localhost:8000/ocr/base64 \
 
 ```bash
 # 图片
-curl -X POST http://localhost:8000/ocr/upload -F "file=@scan.png"
+curl -X POST http://localhost:4000/ocr/upload -F "file=@scan.png"
 
 # PDF
-curl -X POST http://localhost:8000/ocr/upload -F "file=@report.pdf"
+curl -X POST http://localhost:4000/ocr/upload -F "file=@report.pdf"
 ```
 
 #### 4.5 Python SDK 调用
@@ -173,14 +173,14 @@ with open("scan.png", "rb") as f:
     b64 = base64.b64encode(f.read()).decode()
 
 resp = requests.post(
-    "http://localhost:8000/ocr/base64",
+    "http://localhost:4000/ocr/base64",
     json={"payload": b64, "fileType": 1},
 ).json()
 
 # 方式二：上传文件
 with open("scan.png", "rb") as f:
     resp = requests.post(
-        "http://localhost:8000/ocr/upload",
+        "http://localhost:4000/ocr/upload",
         files={"file": f},
     ).json()
 
