@@ -2,6 +2,19 @@
 
 基于 [PaddleOCR-VL](https://github.com/PaddlePaddle/PaddleOCR) + FastAPI 的文档 OCR 服务，通过 SiliconFlow API 调用 VLM 进行版面解析与文字识别。支持图片（PNG / JPEG / WebP / BMP）和 PDF 文件，base64 字符串或直接文件上传两种输入方式。
 
+## Setup
+```bash
+# NVIDIA GPU（以 CUDA 12.6 为例）
+python -m pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+
+# x64 CPU
+python -m pip install paddlepaddle==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+
+# paddleocr
+python -m pip install -U "paddleocr[doc-parser]" -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+```
+
 ## 架构设计
 
 ```
@@ -11,8 +24,8 @@
 └──────────────┘     │  ┌─────────────────────────────────┐  │     └─────────────────────┘
                      │  │ 输入适配层                        │  │
                      │  │  ┌─ data URI 解析                 │  │
-                     │  │  ├─ magic bytes MIME 自动检测     │  │
-                     │  │  └─ base64 → ndarray / 临时PDF    │  │
+                     │  │  ├─ fileType 类型分发             │  │
+                     │  │  └─ base64 → ndarray / 临时PDF路径 │  │
                      │  └──────────────┬──────────────────┘  │
                      │                 ▼                      │
                      │  ┌─────────────────────────────────┐  │
@@ -39,15 +52,11 @@ ndarray 输入 (np.ndarray)
   └─ BGR numpy 数组 ─────────────▶ ReadImage 透传 → predict()
                                    (零拷贝，不走磁盘)
 
-List[ndarray] 输入
-  │
-  └─ 多页 PDF 的每页渲染结果 ────▶ 逐页 predict()
-
 base64 输入 (本服务新增)
   │
-  ├─ image/* ────▶ base64 解码 → cv2.imdecode → ndarray → predict()
+  ├─ fileType=1 ─▶ base64 解码 → cv2.imdecode → ndarray → predict()
   │
-  └─ application/pdf ──▶ base64 解码 → 临时文件 → pypdfium2 逐页渲染 → list[ndarray] → predict()
+  └─ fileType=0 ─▶ base64 解码 → 临时 PDF 文件 → pipeline 原生 PDF 处理
 ```
 
 ### API 路由
@@ -80,7 +89,7 @@ python -m venv .venv
 .venv\Scripts\activate      # Windows
 # source .venv/bin/activate # macOS / Linux
 
-pip install paddleocr fastapi uvicorn python-multipart python-dotenv opencv-python pypdfium2
+pip install paddleocr fastapi uvicorn python-multipart python-dotenv opencv-python
 ```
 
 ### 2. 配置 API Key
@@ -122,7 +131,7 @@ base64 -w0 scan.png > scan.b64
 # 调用 API
 curl -X POST http://localhost:8000/ocr/base64 \
   -H "Content-Type: application/json" \
-  -d '{"payload": "'$(cat scan.b64)'"}'
+  -d '{"payload": "'$(cat scan.b64)'", "fileType": 1}'
 ```
 
 #### 4.2 带 data URI 前缀（自动推断格式）
@@ -130,7 +139,7 @@ curl -X POST http://localhost:8000/ocr/base64 \
 ```bash
 curl -X POST http://localhost:8000/ocr/base64 \
   -H "Content-Type: application/json" \
-  -d '{"payload": "data:image/png;base64,iVBORw0KGgo..."}'
+  -d '{"payload": "data:image/png;base64,iVBORw0KGgo...", "fileType": 1}'
 ```
 
 #### 4.3 base64 PDF
@@ -140,7 +149,7 @@ base64 -w0 report.pdf > report.b64
 
 curl -X POST http://localhost:8000/ocr/base64 \
   -H "Content-Type: application/json" \
-  -d '{"payload": "'$(cat report.b64)'", "mime_type": "application/pdf"}'
+  -d '{"payload": "'$(cat report.b64)'", "fileType": 0}'
 ```
 
 #### 4.4 上传文件
@@ -165,7 +174,7 @@ with open("scan.png", "rb") as f:
 
 resp = requests.post(
     "http://localhost:8000/ocr/base64",
-    json={"payload": b64},
+    json={"payload": b64, "fileType": 1},
 ).json()
 
 # 方式二：上传文件
@@ -201,6 +210,6 @@ print(full_md)
 | 决策 | 理由 |
 |------|------|
 | base64 端点在服务层解码，不侵入 pipeline | `predict()` 原生签名 `str \| ndarray \| list[ndarray]` 已覆盖所有场景，改第三方库升级时会被覆盖 |
-| PDF 用临时文件中转 | pypdfium2 / PDFium 引擎需要文件路径，无法直接从 bytes 打开；临时文件用完即删，开销极小 |
-| magic bytes 自动检测 > 显式 mime_type > 后缀名 | 最可靠；data URI 自带类型声明，纯 base64 用文件头判断，不依赖文件名 |
+| PDF 用临时文件路径中转 | 不在服务层引入 PDF 渲染库，直接复用 PaddleOCR pipeline 原生 PDF 处理能力；临时文件用完即删 |
+| base64 payload 使用 `fileType` | `0` 表示 PDF，`1` 表示图片，避免靠 MIME 或 magic bytes 推断业务语义 |
 | cv2.imdecode 解码图片 | 与 OpenCVImageReaderBackend 内部实现一致，BGR 格式对齐 ReadImage 的透传路径 |

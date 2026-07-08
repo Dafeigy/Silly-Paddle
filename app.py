@@ -6,7 +6,7 @@ PaddleOCR-VL RESTful 服务
 2. POST /ocr/upload  — multipart/form-data 直接上传文件
 3. GET  /health      — 健康检查
 
-base64 入参兼容 PNG / JPG / PDF 三种文件格式，自动检测内容类型。
+base64 入参通过 fileType 区分文件类型：0 表示 PDF，1 表示图片。
 """
 
 import base64
@@ -20,7 +20,6 @@ from typing import Optional
 
 import cv2
 import numpy as np
-import pypdfium2 as pdfium
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -77,10 +76,12 @@ class Base64Request(BaseModel):
         description="文件的 base64 编码字符串（支持 data URI 前缀 `data:<mime>;base64,`）",
         examples=["iVBORw0KGgo...", "data:image/png;base64,iVBORw0KGgo..."],
     )
-    mime_type: Optional[str] = Field(
-        default=None,
-        description="显式指定 MIME 类型，如 image/png、application/pdf。留空则自动检测",
-        examples=["image/png", "application/pdf"],
+    fileType: int = Field(
+        ...,
+        ge=0,
+        le=1,
+        description="文件类型：0 表示 PDF，1 表示图片",
+        examples=[1],
     )
 
 
@@ -170,71 +171,44 @@ def decode_b64_to_image(b64_payload: str) -> np.ndarray:
     return img
 
 
-def decode_b64_to_pdf_pages(b64_payload: str) -> list[np.ndarray]:
-    """
-    base64 → PDF 逐页渲染为 BGR numpy array 列表。
-
-    使用临时文件作为 pypdfium2 的中转（PDFium 引擎需要文件路径），
-    渲染完成后立即清理临时文件。
-    """
+def write_b64_to_temp_pdf(b64_payload: str) -> str:
+    """base64 → 临时 PDF 文件路径，由 PaddleOCR pipeline 原生处理。"""
     b64_payload, _ = strip_data_uri(b64_payload)
     pdf_bytes = base64.b64decode(b64_payload)
 
-    # 写入临时文件
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     try:
         tmp.write(pdf_bytes)
-        tmp_path = tmp.name
+        return tmp.name
     finally:
         tmp.close()
-
-    try:
-        doc = pdfium.PdfDocument(tmp_path)
-        doc.init_forms()
-        pages: list[np.ndarray] = []
-        for page in doc:
-            bgr = page.render(scale=2.0).to_numpy()
-            pages.append(bgr)
-            page.close()
-        doc.close()
-        return pages
-    finally:
-        os.unlink(tmp_path)
-
-
-def resolve_mime_type(raw: bytes, *, explicit_mime: Optional[str]) -> str:
-    """决定最终使用的 MIME 类型：显式声明 > 自动检测"""
-    if explicit_mime:
-        return explicit_mime
-    return detect_mime_type(raw)
 
 
 # ─── 核心预测逻辑 ────────────────────────────────────────────────
 
 
-def do_predict(payload: str, mime_type: Optional[str] = None) -> list:
+def do_predict(payload: str, file_type: int) -> list:
     """
     统一的预测入口：
 
     - 图片 (image/*) → base64 解码为 ndarray → pipeline.predict(ndarray)
-    - PDF (application/pdf) → base64 解码 → 逐页渲染为 ndarray 列表 → pipeline.predict(list[ndarray])
+    - PDF → base64 解码为临时文件 → pipeline.predict(path)
     """
-    # 先做一次轻量 base64 解码，取前几个字节用于检测类型
-    clean_b64, uri_mime = strip_data_uri(payload)
-    raw_head = base64.b64decode(clean_b64[:32])  # 只解码头部足够做检测
-    mime = resolve_mime_type(raw_head, explicit_mime=mime_type or uri_mime)
+    if file_type == 0:
+        logger.info("输入类型: PDF")
+        tmp_path = write_b64_to_temp_pdf(payload)
+        try:
+            return list(pipeline.predict(tmp_path))
+        finally:
+            os.unlink(tmp_path)
 
-    logger.info(f"输入类型: {mime}")
-
-    if mime == "application/pdf":
-        pages = decode_b64_to_pdf_pages(clean_b64)
-        logger.info(f"PDF 共 {len(pages)} 页")
-        return list(pipeline.predict(pages))
-
-    else:
-        img = decode_b64_to_image(clean_b64)
+    if file_type == 1:
+        logger.info("输入类型: image")
+        img = decode_b64_to_image(payload)
         logger.info(f"图片尺寸: {img.shape[1]}x{img.shape[0]}")
         return list(pipeline.predict(img))
+
+    raise ValueError("fileType 只支持 0 或 1：0 表示 PDF，1 表示图片")
 
 
 # ─── 路由 ────────────────────────────────────────────────────────
@@ -251,6 +225,7 @@ async def ocr_base64(req: Base64Request):
     通过 base64 字符串进行 OCR。
 
     支持的格式：PNG、JPEG、WebP、BMP、PDF（多页自动逐页识别）。
+    JSON 中 fileType=0 表示 PDF，fileType=1 表示图片。
     支持纯 base64 字符串或 `data:<mime>;base64,<data>` 格式的 data URI。
     """
     if pipeline is None:
@@ -258,7 +233,7 @@ async def ocr_base64(req: Base64Request):
 
     try:
         st = time.perf_counter()
-        results = do_predict(req.payload, req.mime_type)
+        results = do_predict(req.payload, req.fileType)
         elapsed = time.perf_counter() - st
 
         ocr_results = []
