@@ -10,6 +10,7 @@ base64 入参通过 fileType 区分文件类型：0 表示 PDF，1 表示图片�
 """
 
 import base64
+import asyncio
 import logging
 import os
 import tempfile
@@ -23,6 +24,7 @@ import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from paddleocr import PaddleOCRVL
 
@@ -39,23 +41,57 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 logger = logging.getLogger("ocr-service")
+PIPELINE_POOL_SIZE = max(1, int(os.environ.get("PIPELINE_POOL_SIZE", "2")))
 
 # ─── Pipeline 生命周期 ───────────────────────────────────────────
-pipeline: Optional[PaddleOCRVL] = None
+pipeline_pool: Optional[asyncio.Queue[PaddleOCRVL]] = None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global pipeline
-    logger.info("正在初始化 PaddleOCR-VL pipeline ...")
-    pipeline = PaddleOCRVL(
+def create_pipeline() -> PaddleOCRVL:
+    return PaddleOCRVL(
         vl_rec_backend="vllm-server",
         vl_rec_server_url="https://api.siliconflow.cn/v1",
         vl_rec_api_model_name="PaddlePaddle/PaddleOCR-VL-1.5",
         vl_rec_api_key=API_KEY,
     )
+
+
+def get_pipeline_pool() -> asyncio.Queue[PaddleOCRVL]:
+    if pipeline_pool is None:
+        raise HTTPException(status_code=503, detail="Pipeline 尚未初始化")
+    return pipeline_pool
+
+
+@asynccontextmanager
+async def lease_pipeline(pool: asyncio.Queue[PaddleOCRVL]):
+    wait_start = time.perf_counter()
+    ocr_pipeline = await pool.get()
+    wait_seconds = time.perf_counter() - wait_start
+    logger.info(
+        "已获取 PaddleOCR-VL pipeline，等待 %.3f 秒，空闲: %s/%s",
+        wait_seconds,
+        pool.qsize(),
+        PIPELINE_POOL_SIZE,
+    )
+    try:
+        yield ocr_pipeline
+    finally:
+        pool.put_nowait(ocr_pipeline)
+        logger.info("PaddleOCR-VL pipeline 已归还，空闲: %s/%s", pool.qsize(), PIPELINE_POOL_SIZE)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pipeline_pool
+    logger.info("正在初始化 PaddleOCR-VL pipeline ...")
+    pool: asyncio.Queue[PaddleOCRVL] = asyncio.Queue(maxsize=PIPELINE_POOL_SIZE)
+    for idx in range(PIPELINE_POOL_SIZE):
+        logger.info("Initializing PaddleOCR-VL pipeline %s/%s ...", idx + 1, PIPELINE_POOL_SIZE)
+        pool.put_nowait(create_pipeline())
+    pipeline_pool = pool
     logger.info("Pipeline 就绪")
     yield
+    pipeline_pool = None
     logger.info("服务关闭")
 
 
@@ -187,7 +223,7 @@ def write_b64_to_temp_pdf(b64_payload: str) -> str:
 # ─── 核心预测逻辑 ────────────────────────────────────────────────
 
 
-def do_predict(payload: str, file_type: int) -> list:
+def do_predict(ocr_pipeline: PaddleOCRVL, payload: str, file_type: int) -> list:
     """
     统一的预测入口：
 
@@ -198,7 +234,7 @@ def do_predict(payload: str, file_type: int) -> list:
         logger.info("输入类型: PDF")
         tmp_path = write_b64_to_temp_pdf(payload)
         try:
-            return list(pipeline.predict(tmp_path))
+            return list(ocr_pipeline.predict(tmp_path))
         finally:
             os.unlink(tmp_path)
 
@@ -206,7 +242,7 @@ def do_predict(payload: str, file_type: int) -> list:
         logger.info("输入类型: image")
         img = decode_b64_to_image(payload)
         logger.info(f"图片尺寸: {img.shape[1]}x{img.shape[0]}")
-        return list(pipeline.predict(img))
+        return list(ocr_pipeline.predict(img))
 
     raise ValueError("fileType 只支持 0 或 1：0 表示 PDF，1 表示图片")
 
@@ -228,12 +264,11 @@ async def ocr_base64(req: Base64Request):
     JSON 中 fileType=0 表示 PDF，fileType=1 表示图片。
     支持纯 base64 字符串或 `data:<mime>;base64,<data>` 格式的 data URI。
     """
-    if pipeline is None:
-        raise HTTPException(status_code=503, detail="Pipeline 尚未初始化")
-
+    pool = get_pipeline_pool()
     try:
         st = time.perf_counter()
-        results = do_predict(req.payload, req.fileType)
+        async with lease_pipeline(pool) as ocr_pipeline:
+            results = await run_in_threadpool(do_predict, ocr_pipeline, req.payload, req.fileType)
         elapsed = time.perf_counter() - st
 
         ocr_results = []
@@ -262,9 +297,7 @@ async def ocr_upload(file: UploadFile = File(...)):
 
     支持 PNG / JPEG / WebP / BMP / PDF 格式。
     """
-    if pipeline is None:
-        raise HTTPException(status_code=503, detail="Pipeline 尚未初始化")
-
+    pool = get_pipeline_pool()
     try:
         raw = await file.read()
         mime = detect_mime_type(raw)
@@ -280,7 +313,8 @@ async def ocr_upload(file: UploadFile = File(...)):
 
             try:
                 st = time.perf_counter()
-                results = list(pipeline.predict(tmp_path))
+                async with lease_pipeline(pool) as ocr_pipeline:
+                    results = await run_in_threadpool(lambda: list(ocr_pipeline.predict(tmp_path)))
                 elapsed = time.perf_counter() - st
             finally:
                 os.unlink(tmp_path)
@@ -295,7 +329,8 @@ async def ocr_upload(file: UploadFile = File(...)):
                 )
 
             st = time.perf_counter()
-            results = list(pipeline.predict(img))
+            async with lease_pipeline(pool) as ocr_pipeline:
+                results = await run_in_threadpool(lambda: list(ocr_pipeline.predict(img)))
             elapsed = time.perf_counter() - st
 
         ocr_results = []
@@ -322,4 +357,4 @@ async def ocr_upload(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=4000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=4000, reload=False)

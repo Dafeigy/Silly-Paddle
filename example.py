@@ -8,7 +8,7 @@ base_url = os.environ['BASE_URL']
 
 import json
 
-INPUT_FILE = "NEXT_STEP.pdf"
+INPUT_FILE = "Litellm.pdf"
 with open (INPUT_FILE, 'rb') as f:
     content = f.read()
 
@@ -21,7 +21,7 @@ req = requests.post(f"{base_url}/ocr/base64", json=payload)
 
 response = req.json()
 
-with open ("pdf.json", "w") as f:
-    f.write(json.dumps(response))
+with open ("example1.json", "w", encoding='utf-8') as f:
+    f.write(json.dumps(response, ensure_ascii=False, indent=4))
 
 print(response['results'][0]['markdown_text'])

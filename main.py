@@ -9,7 +9,8 @@ output_dir = Path("./output")
 load_dotenv()
 
 API_KEY = os.environ['API_KEY']
-print(API_KEY)
+
+file_path = "./ModelRouter.pdf"
 pipeline = PaddleOCRVL(
     vl_rec_backend="vllm-server", 
     vl_rec_server_url="https://api.siliconflow.cn/v1",
@@ -19,9 +20,11 @@ pipeline = PaddleOCRVL(
 
 print("Start predicting...")
 st = time.time()
-output = pipeline.predict("paddleocr_vl_demo.png")
+output = pipeline.predict(file_path)
 et = time.time()
-print("Predicting done, time cost: ", et - st, "seconds")
+
 
 final_res = "".join([res.markdown['markdown_texts'] for res in output])
 print(final_res)
+
+print(f"Predicting {file_path} done, time cost: {et - st} seconds")
